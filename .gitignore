@@ -40,8 +40,12 @@ Thumbs.db
 # ============================================================
 
 *.tmp
-*.log# Local backups and extracted datasets
+*.log
+# Local backups and extracted datasets
 *.bak
 *.backup
 *.pre-*-backup
 data/genes/ncbi_extracted/
+*-backup
+results/csv_backup*/
+results/logs/

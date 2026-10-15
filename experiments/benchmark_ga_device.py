@@ -1,15 +1,19 @@
-﻿from pathlib import Path
+from pathlib import Path
 import sys
 import time
-import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from optimizers.genetic_algorithm import optimize_ga
-from core.sequence import get_codons
 from core.verification import verify_translation
+
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
 
 
 def main():
@@ -20,21 +24,29 @@ def main():
         if line.strip() and not line.startswith(">")
     ).upper()
 
-    print("GPU available:", torch.cuda.is_available())
-    if torch.cuda.is_available():
+    cuda_available = TORCH_AVAILABLE and torch.cuda.is_available()
+    print("PyTorch available:", TORCH_AVAILABLE)
+    print("GPU available:", cuda_available)
+    if cuda_available:
         print("GPU:", torch.cuda.get_device_name(0))
 
-    for device in ("cpu", "cuda"):
+    devices = ["cpu"]
+    if cuda_available:
+        devices.append("cuda")
+    else:
+        print("\nNote: CUDA not available in this environment. Benchmarking CPU only.")
+
+    for device in devices:
         print(f"\nDevice: {device.upper()}")
         start = time.perf_counter()
 
         result = optimize_ga(
-        dna_sequence=sequence,
-        organism="ecoli",
-        gc_min=0.40,
-        gc_max=0.60,
-        population_size=100,
-        generations=100,
+            dna_sequence=sequence,
+            organism="ecoli",
+            gc_min=0.40,
+            gc_max=0.60,
+            population_size=100,
+            generations=100,
             seed=42,
             device=device,
         )

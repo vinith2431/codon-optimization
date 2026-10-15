@@ -1465,8 +1465,11 @@ def optimize_ga(
 
         selected_device = device
         if selected_device == "auto":
-            import torch
-            selected_device = "cuda" if torch.cuda.is_available() else "cpu"
+            try:
+                import torch
+                selected_device = "cuda" if torch.cuda.is_available() else "cpu"
+            except ImportError:
+                selected_device = "cpu"
 
         if selected_device == "cuda":
             import torch

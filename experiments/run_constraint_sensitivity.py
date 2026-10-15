@@ -1,68 +1,37 @@
 """
-Constraint Sensitivity Experiment
+Constraint Sensitivity Benchmark.
 
-Tests the sensitivity of the GA to:
-1. K-mer frequency threshold and penalty weight
-2. 5' local GC penalty weight
-3. Combined k-mer + 5' GC constraints
+Systematically tests the effect of constraint stringency on codon optimization:
+1. Repeated-sequence thresholds: 8 bp, 10 bp, 12 bp
+2. 5' GC window ranges: strict [0.42, 0.48], standard [0.40, 0.50], relaxed [0.35, 0.55]
+3. Local sliding-window GC ranges: strict [0.35, 0.65], standard [0.30, 0.70], relaxed [0.25, 0.75]
 
-Dataset:
-    10 biological benchmark genes in data/genes/fasta/
-
-Output:
-    results/csv/constraint_sensitivity.csv
+Outputs:
+    results/csv/constraint_sensitivity.csv  (Per-run records)
+    results/csv/constraint_summary.csv      (Aggregated statistics per configuration)
 """
 
 from pathlib import Path
+import argparse
 import csv
-import time
+import statistics
 import sys
-from collections import Counter
+import time
+from typing import Any, Dict, List
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-# ============================================================
-# PROJECT ROOT
-# ============================================================
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-
-# ============================================================
-# IMPORTS
-# ============================================================
-
-from core.sequence import gc_content
 from core.cai import calculate_cai
-from core.similarity import (
-    changed_positions,
-    total_codons,
-    edit_rate,
-)
-from core.verification import (
-    translate_dna,
-    verify_translation,
-)
+from core.sequence import clean_dna, gc_content
+from core.similarity import edit_rate
+from core.validator import assess_candidate, DEFAULT_CONSTRAINTS
 from optimizers.genetic_algorithm import optimize_ga
 
-
-# ============================================================
-# PATHS
-# ============================================================
-
-FASTA_DIR = PROJECT_ROOT / "data" / "genes" / "fasta"
-OUTPUT_DIR = PROJECT_ROOT / "results" / "csv"
-
-OUTPUT_FILE = (
-    OUTPUT_DIR / "constraint_sensitivity.csv"
-)
-
-
-# ============================================================
-# BIOLOGICAL BENCHMARK DATASET
-# ============================================================
+ORGANISM = "ecoli"
+DATA_DIR = ROOT / "data" / "genes" / "fasta"
+OUT_DIR = ROOT / "results" / "csv"
 
 GENES = {
     "GFP": "gene01_gfp.fasta",
@@ -77,913 +46,282 @@ GENES = {
     "sodA": "gene10_soda.fasta",
 }
 
-
-# ============================================================
-# GA SETTINGS
-# ============================================================
-
-POPULATION_SIZE = 100
-GENERATIONS = 100
-MUTATION_RATE = 0.02
-CROSSOVER_RATE = 0.80
-TOURNAMENT_SIZE = 3
-ELITISM = 2
-SEED = 42
-
-CAI_WEIGHT = 1.0
-GC_WEIGHT = 10.0
-TARGET_GC_WEIGHT = 10.0
-LOCAL_GC_WEIGHT = 5.0
-REPEAT_WEIGHT = 5.0
-HOMOPOLYMER_WEIGHT = 5.0
-RESTRICTION_WEIGHT = 5.0
-EDIT_WEIGHT = 0.0
+SEEDS = [42, 123, 456]
 
 
-# ============================================================
-# K-MER SETTINGS
-# ============================================================
-
-KMER_SIZE = 6
-
-KMER_THRESHOLDS = [
-    0.02,
-    0.01,
-    0.005,
-]
-
-KMER_WEIGHTS = [
-    5.0,
-    10.0,
-    20.0,
-]
+def read_fasta(path: Path) -> str:
+    with open(path, encoding="utf-8") as f:
+        seq = "".join(line.strip() for line in f if line.strip() and not line.startswith(">"))
+    return clean_dna(seq)
 
 
-# ============================================================
-# 5' GC SETTINGS
-# ============================================================
-
-FIVE_PRIME_WINDOW = 60
-
-FIVE_PRIME_GC_MIN = 0.40
-FIVE_PRIME_GC_MAX = 0.60
-
-FIVE_PRIME_WEIGHTS = [
-    5.0,
-    10.0,
-    20.0,
-]
+def write_csv(path: Path, rows: List[Dict[str, Any]]):
+    if not rows:
+        print(f"No rows to write: {path.name}")
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = list(dict.fromkeys(k for r in rows for k in r.keys()))
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"Saved: {path}")
 
 
-# ============================================================
-# COMBINED EXPERIMENTS
-# ============================================================
-
-COMBINED_CONFIGS = [
-    {
-        "name": "Combined_02_5_5",
-        "kmer_threshold": 0.02,
-        "kmer_weight": 5.0,
-        "five_prime_weight": 5.0,
-    },
-    {
-        "name": "Combined_01_10_10",
-        "kmer_threshold": 0.01,
-        "kmer_weight": 10.0,
-        "five_prime_weight": 10.0,
-    },
-    {
-        "name": "Combined_005_20_20",
-        "kmer_threshold": 0.005,
-        "kmer_weight": 20.0,
-        "five_prime_weight": 20.0,
-    },
-    {
-        "name": "Combined_01_20_20",
-        "kmer_threshold": 0.01,
-        "kmer_weight": 20.0,
-        "five_prime_weight": 20.0,
-    },
-    {
-        "name": "Combined_005_20_10",
-        "kmer_threshold": 0.005,
-        "kmer_weight": 20.0,
-        "five_prime_weight": 10.0,
-    },
-]
-
-
-# ============================================================
-# FASTA READER
-# ============================================================
-
-def read_fasta(path):
-    """Read a DNA FASTA sequence safely."""
-
-    with open(path, "r", encoding="utf-8") as f:
-        lines = f.read().splitlines()
-
-    sequence_parts = []
-
-    for line in lines:
-
-        line = line.strip()
-
-        if not line:
-            continue
-
-        if line.startswith(">"):
-            continue
-
-        cleaned = "".join(
-            base
-            for base in line.upper()
-            if base in "ACGT"
-        )
-
-        if cleaned:
-            sequence_parts.append(cleaned)
-
-    sequence = "".join(sequence_parts)
-
-    if not sequence:
-        raise ValueError(
-            f"No DNA sequence found in FASTA file: {path}"
-        )
-
-    invalid = set(sequence) - set("ACGT")
-
-    if invalid:
-        raise ValueError(
-            f"Invalid DNA bases found: {sorted(invalid)}"
-        )
-
-    return sequence
-
-
-# ============================================================
-# K-MER STATISTICS
-# ============================================================
-
-def get_max_kmer_stats(sequence, k=6):
-    """
-    Return the most frequent k-mer and its frequency.
-    """
-
-    if len(sequence) < k:
-        return "", 0.0
-
-    kmers = [
-        sequence[i:i + k]
-        for i in range(len(sequence) - k + 1)
+def get_constraint_configs() -> List[Dict[str, Any]]:
+    """Controlled experimental constraint configurations."""
+    return [
+        {
+            "config_name": "baseline_standard",
+            "category": "baseline",
+            "repeat_length": 12,
+            "five_prime_min": 0.40,
+            "five_prime_max": 0.50,
+            "local_min": 0.30,
+            "local_max": 0.70,
+        },
+        # 1. Repeat length sensitivity
+        {
+            "config_name": "repeat_strict_8bp",
+            "category": "repeat_threshold",
+            "repeat_length": 8,
+            "five_prime_min": 0.40,
+            "five_prime_max": 0.50,
+            "local_min": 0.30,
+            "local_max": 0.70,
+        },
+        {
+            "config_name": "repeat_moderate_10bp",
+            "category": "repeat_threshold",
+            "repeat_length": 10,
+            "five_prime_min": 0.40,
+            "five_prime_max": 0.50,
+            "local_min": 0.30,
+            "local_max": 0.70,
+        },
+        {
+            "config_name": "repeat_relaxed_12bp",
+            "category": "repeat_threshold",
+            "repeat_length": 12,
+            "five_prime_min": 0.40,
+            "five_prime_max": 0.50,
+            "local_min": 0.30,
+            "local_max": 0.70,
+        },
+        # 2. 5' GC window sensitivity
+        {
+            "config_name": "five_prime_strict_42_48",
+            "category": "five_prime_gc",
+            "repeat_length": 12,
+            "five_prime_min": 0.42,
+            "five_prime_max": 0.48,
+            "local_min": 0.30,
+            "local_max": 0.70,
+        },
+        {
+            "config_name": "five_prime_relaxed_35_55",
+            "category": "five_prime_gc",
+            "repeat_length": 12,
+            "five_prime_min": 0.35,
+            "five_prime_max": 0.55,
+            "local_min": 0.30,
+            "local_max": 0.70,
+        },
+        # 3. Local GC window sensitivity
+        {
+            "config_name": "local_gc_strict_35_65",
+            "category": "local_gc",
+            "repeat_length": 12,
+            "five_prime_min": 0.40,
+            "five_prime_max": 0.50,
+            "local_min": 0.35,
+            "local_max": 0.65,
+        },
+        {
+            "config_name": "local_gc_relaxed_25_75",
+            "category": "local_gc",
+            "repeat_length": 12,
+            "five_prime_min": 0.40,
+            "five_prime_max": 0.50,
+            "local_min": 0.25,
+            "local_max": 0.75,
+        },
     ]
 
-    counts = Counter(kmers)
 
-    most_common_kmer, count = (
-        counts.most_common(1)[0]
-    )
+def summarize_constraints(detailed_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    configs = list(dict.fromkeys(r["config_name"] for r in detailed_rows))
+    summary = []
+
+    for cfg in configs:
+        c_rows = [r for r in detailed_rows if r["config_name"] == cfg]
+        total_runs = len(c_rows)
+        feasible_runs = [r for r in c_rows if r.get("feasible") is True]
+
+        feas_rate = len(feasible_runs) / total_runs if total_runs > 0 else 0.0
+        feasible_cais = [r["optimized_cai"] for r in feasible_runs if r.get("optimized_cai") is not None]
+        all_cais = [r["optimized_cai"] for r in c_rows if r.get("optimized_cai") is not None]
+        runtimes = [r["runtime_seconds"] for r in c_rows if r.get("runtime_seconds") is not None]
+        edits = [r["edit_rate"] for r in c_rows if r.get("edit_rate") is not None]
+        gc_devs = [r["gc_deviation"] for r in c_rows if r.get("gc_deviation") is not None]
+
+        summary.append({
+            "config_name": cfg,
+            "category": c_rows[0].get("category", ""),
+            "total_runs": total_runs,
+            "feasible_runs": len(feasible_runs),
+            "feasibility_rate_percent": round(feas_rate * 100, 2),
+            "mean_feasible_cai": round(statistics.mean(feasible_cais), 4) if feasible_cais else "None",
+            "std_feasible_cai": (
+                round(statistics.stdev(feasible_cais), 4) if len(feasible_cais) > 1 else 0.0
+            ),
+            "mean_overall_cai": round(statistics.mean(all_cais), 4) if all_cais else "None",
+            "mean_runtime_seconds": round(statistics.mean(runtimes), 4) if runtimes else 0.0,
+            "mean_edit_rate_percent": round(statistics.mean(edits) * 100, 2) if edits else 0.0,
+            "mean_gc_deviation": round(statistics.mean(gc_devs), 4) if gc_devs else 0.0,
+        })
+    return summary
 
-    frequency = count / len(kmers)
-
-    return most_common_kmer, frequency
-
-
-# ============================================================
-# 5' GC
-# ============================================================
-
-def get_five_prime_gc(sequence, window=60):
-    """
-    Calculate GC fraction in the first window bases.
-    """
-
-    if not sequence:
-        return 0.0
-
-    region = sequence[:window]
-
-    return gc_content(region)
-
-
-# ============================================================
-# CONFIGURATION LIST
-# ============================================================
-
-def build_experiments():
-    """
-    Build all 18 configurations.
-
-    1 baseline
-    9 k-mer experiments
-    3 5' GC experiments
-    5 combined experiments
-    """
-
-    experiments = []
-
-    # --------------------------------------------------------
-    # Baseline
-    # --------------------------------------------------------
-
-    experiments.append(
-        {
-            "name": "Baseline_GA",
-            "type": "baseline",
-            "kmer_threshold": None,
-            "kmer_weight": 0.0,
-            "five_prime_weight": 0.0,
-        }
-    )
-
-    # --------------------------------------------------------
-    # K-mer sensitivity
-    # --------------------------------------------------------
-
-    for threshold in KMER_THRESHOLDS:
-
-        for weight in KMER_WEIGHTS:
-
-            experiments.append(
-                {
-                    "name": (
-                        f"Kmer_t{threshold}_w{weight}"
-                    ),
-                    "type": "kmer",
-                    "kmer_threshold": threshold,
-                    "kmer_weight": weight,
-                    "five_prime_weight": 0.0,
-                }
-            )
-
-    # --------------------------------------------------------
-    # 5' GC sensitivity
-    # --------------------------------------------------------
-
-    for weight in FIVE_PRIME_WEIGHTS:
-
-        experiments.append(
-            {
-                "name": f"FivePrimeGC_w{weight}",
-                "type": "five_prime_gc",
-                "kmer_threshold": None,
-                "kmer_weight": 0.0,
-                "five_prime_weight": weight,
-            }
-        )
-
-    # --------------------------------------------------------
-    # Combined sensitivity
-    # --------------------------------------------------------
-
-    for config in COMBINED_CONFIGS:
-
-        experiments.append(
-            {
-                "name": config["name"],
-                "type": "combined",
-                "kmer_threshold": (
-                    config["kmer_threshold"]
-                ),
-                "kmer_weight": (
-                    config["kmer_weight"]
-                ),
-                "five_prime_weight": (
-                    config["five_prime_weight"]
-                ),
-            }
-        )
-
-    return experiments
-
-
-# ============================================================
-# RUN ONE EXPERIMENT
-# ============================================================
-
-def run_one(
-    gene_name,
-    sequence,
-    config,
-):
-
-    # --------------------------------------------------------
-    # Original sequence statistics
-    # --------------------------------------------------------
-
-    original_cai = calculate_cai(
-        sequence,
-        organism="ecoli",
-    )
-
-    original_gc = gc_content(
-        sequence
-    )
-
-    # Keep this for reference / checking.
-    original_protein = translate_dna(
-        sequence
-    )
-
-    start = time.perf_counter()
-
-    # --------------------------------------------------------
-    # Run GA
-    # --------------------------------------------------------
-
-    optimized = optimize_ga(
-        dna_sequence=sequence,
-        organism="ecoli",
-
-        # Existing constraints
-        gc_min=None,
-        gc_max=None,
-        target_gc=None,
-
-        local_gc_window=None,
-        local_gc_min=None,
-        local_gc_max=None,
-
-        repeat_length=None,
-        max_homopolymer=None,
-        forbidden_sites=None,
-
-        # GA
-        population_size=POPULATION_SIZE,
-        generations=GENERATIONS,
-        mutation_rate=MUTATION_RATE,
-        crossover_rate=CROSSOVER_RATE,
-        tournament_size=TOURNAMENT_SIZE,
-        elitism=ELITISM,
-
-        # Existing objective weights
-        cai_weight=CAI_WEIGHT,
-        gc_weight=GC_WEIGHT,
-        target_gc_weight=TARGET_GC_WEIGHT,
-        local_gc_weight=LOCAL_GC_WEIGHT,
-        repeat_weight=REPEAT_WEIGHT,
-        homopolymer_weight=HOMOPOLYMER_WEIGHT,
-        restriction_weight=RESTRICTION_WEIGHT,
-        edit_weight=EDIT_WEIGHT,
-
-        # ----------------------------------------------------
-        # Codon-pair bias
-        # ----------------------------------------------------
-
-        codon_pair_table=None,
-        codon_pair_weight=0.0,
-
-        # ----------------------------------------------------
-        # K-mer constraint
-        # ----------------------------------------------------
-
-        kmer_size=(
-            KMER_SIZE
-            if config["kmer_weight"] > 0
-            else None
-        ),
-
-        max_kmer_frequency=(
-            config["kmer_threshold"]
-            if config["kmer_weight"] > 0
-            else None
-        ),
-
-        kmer_weight=(
-            config["kmer_weight"]
-        ),
-
-        # ----------------------------------------------------
-        # 5' GC constraint
-        # ----------------------------------------------------
-
-        five_prime_window=(
-            FIVE_PRIME_WINDOW
-            if config["five_prime_weight"] > 0
-            else None
-        ),
-
-        five_prime_gc_min=(
-            FIVE_PRIME_GC_MIN
-            if config["five_prime_weight"] > 0
-            else None
-        ),
-
-        five_prime_gc_max=(
-            FIVE_PRIME_GC_MAX
-            if config["five_prime_weight"] > 0
-            else None
-        ),
-
-        five_prime_gc_weight=(
-            config["five_prime_weight"]
-        ),
-
-        seed=SEED,
-        return_history=False,
-    )
-
-    runtime = (
-        time.perf_counter() - start
-    )
-
-    # --------------------------------------------------------
-    # Optimized sequence statistics
-    # --------------------------------------------------------
-
-    optimized_cai = calculate_cai(
-        optimized,
-        organism="ecoli",
-    )
-
-    optimized_gc = gc_content(
-        optimized
-    )
-
-    # --------------------------------------------------------
-    # Protein preservation
-    #
-    # IMPORTANT:
-    # verify_translation() expects:
-    #     original DNA
-    #     optimized DNA
-    #
-    # Do NOT pass original_protein here.
-    # --------------------------------------------------------
-
-    verification = verify_translation(
-        sequence,
-        optimized,
-    )
-
-    protein_preserved = (
-        verification["valid"]
-    )
-
-    # --------------------------------------------------------
-    # Sequence changes
-    # --------------------------------------------------------
-
-    changed = changed_positions(
-        sequence,
-        optimized,
-    )
-
-    codons = total_codons(
-        sequence
-    )
-
-    edit = edit_rate(
-        sequence,
-        optimized,
-    )
-
-    # --------------------------------------------------------
-    # K-mer statistics
-    # --------------------------------------------------------
-
-    max_kmer, max_kmer_frequency = (
-        get_max_kmer_stats(
-            optimized,
-            KMER_SIZE,
-        )
-    )
-
-    # --------------------------------------------------------
-    # 5' GC statistics
-    # --------------------------------------------------------
-
-    five_prime_gc = get_five_prime_gc(
-        optimized,
-        FIVE_PRIME_WINDOW,
-    )
-
-    # --------------------------------------------------------
-    # Return result
-    # --------------------------------------------------------
-
-    return {
-        "gene": gene_name,
-
-        "experiment": config["name"],
-
-        "type": config["type"],
-
-        "kmer_size": (
-            KMER_SIZE
-            if config["kmer_weight"] > 0
-            else ""
-        ),
-
-        "kmer_threshold": (
-            config["kmer_threshold"]
-            if config["kmer_threshold"] is not None
-            else ""
-        ),
-
-        "kmer_weight": (
-            config["kmer_weight"]
-        ),
-
-        "five_prime_window": (
-            FIVE_PRIME_WINDOW
-            if config["five_prime_weight"] > 0
-            else ""
-        ),
-
-        "five_prime_gc_min": (
-            FIVE_PRIME_GC_MIN
-            if config["five_prime_weight"] > 0
-            else ""
-        ),
-
-        "five_prime_gc_max": (
-            FIVE_PRIME_GC_MAX
-            if config["five_prime_weight"] > 0
-            else ""
-        ),
-
-        "five_prime_gc_weight": (
-            config["five_prime_weight"]
-        ),
-
-        "original_cai": (
-            original_cai
-        ),
-
-        "optimized_cai": (
-            optimized_cai
-        ),
-
-        "delta_cai": (
-            optimized_cai
-            - original_cai
-        ),
-
-        "original_gc_percent": (
-            original_gc * 100
-        ),
-
-        "optimized_gc_percent": (
-            optimized_gc * 100
-        ),
-
-        "five_prime_gc_percent": (
-            five_prime_gc * 100
-            if config["five_prime_weight"] > 0
-            else ""
-        ),
-
-        "max_kmer": (
-            max_kmer
-            if config["kmer_weight"] > 0
-            else ""
-        ),
-
-        "max_kmer_frequency": (
-            max_kmer_frequency
-            if config["kmer_weight"] > 0
-            else ""
-        ),
-
-        "changed_codons": (
-            changed
-        ),
-
-        "total_codons": (
-            codons
-        ),
-
-        "edit_rate_percent": (
-            edit * 100
-        ),
-
-        "runtime_seconds": (
-            runtime
-        ),
-
-        "protein_preserved": (
-            protein_preserved
-        ),
-
-        "sequence_changed": (
-            sequence != optimized
-        ),
-    }
-
-
-# ============================================================
-# MAIN
-# ============================================================
 
 def main():
+    parser = argparse.ArgumentParser(description="Run constraint sensitivity experiment")
+    parser.add_argument("--smoke", action="store_true", help="Run quick smoke test")
+    args = parser.parse_args()
 
-    experiments = build_experiments()
+    gene_items = list(GENES.items())
+    configs = get_constraint_configs()
 
-    total_runs = (
-        len(GENES)
-        * len(experiments)
-    )
-
-    print()
-    print("=" * 75)
-    print("CONSTRAINT SENSITIVITY EXPERIMENT")
-    print("=" * 75)
-
-    print(
-        f"Genes         : {len(GENES)}"
-    )
-
-    print(
-        f"Configurations: {len(experiments)}"
-    )
-
-    print(
-        f"Total runs    : {total_runs}"
-    )
-
-    print(
-        "Host          : ecoli"
-    )
-
-    print(
-        f"K-mer size    : {KMER_SIZE}"
-    )
-
-    print(
-        f"5' GC window  : "
-        f"{FIVE_PRIME_WINDOW} bp"
-    )
-
-    print(
-        f"5' GC range   : "
-        f"{FIVE_PRIME_GC_MIN * 100:.0f}% - "
-        f"{FIVE_PRIME_GC_MAX * 100:.0f}%"
-    )
+    if args.smoke:
+        gene_items = gene_items[:2]
+        configs = configs[:3]  # baseline, strict 8bp repeat, relaxed 12bp repeat
+        seeds = [42]
+        ga_pop, ga_gen = 25, 10
+    else:
+        seeds = SEEDS
+        ga_pop, ga_gen = 60, 50
 
     print("=" * 75)
-    print()
+    print("CONSTRAINT SENSITIVITY BENCHMARK")
+    print(f"Genes: {len(gene_items)}, Configs: {len(configs)}, Seeds: {seeds}")
+    print(f"GA Population: {ga_pop}, Generations: {ga_gen}")
+    print("=" * 75)
 
-    results = []
+    detailed_rows: List[Dict[str, Any]] = []
 
-    successful = 0
-    errors = 0
-    protein_failures = 0
-
-    run_number = 0
-
-    # ========================================================
-    # Loop through genes
-    # ========================================================
-
-    for gene_name, filename in GENES.items():
-
-        fasta_path = (
-            FASTA_DIR / filename
-        )
-
+    for gene_name, fname in gene_items:
+        fasta_path = DATA_DIR / fname
         if not fasta_path.exists():
-
-            print(
-                f"ERROR: Missing FASTA file: "
-                f"{fasta_path}"
-            )
-
-            errors += len(experiments)
-
             continue
+        original = read_fasta(fasta_path)
+        orig_cai = calculate_cai(original, ORGANISM)
 
-        sequence = read_fasta(
-            fasta_path
-        )
+        for cfg in configs:
+            test_constraints = dict(DEFAULT_CONSTRAINTS)
+            test_constraints.update({
+                "repeat_length": cfg["repeat_length"],
+                "five_prime_min": cfg["five_prime_min"],
+                "five_prime_max": cfg["five_prime_max"],
+                "local_min": cfg["local_min"],
+                "local_max": cfg["local_max"],
+            })
 
-        print("-" * 75)
-
-        print(
-            f"Gene: {gene_name}"
-        )
-
-        print(
-            f"Original length: "
-            f"{len(sequence)} bp"
-        )
-
-        print(
-            f"Original GC: "
-            f"{gc_content(sequence) * 100:.2f}%"
-        )
-
-        print("-" * 75)
-
-        # ====================================================
-        # Run all configurations
-        # ====================================================
-
-        for config in experiments:
-
-            run_number += 1
-
-            print()
-
-            print(
-                f"[{run_number}/{total_runs}] "
-                f"{config['name']}"
-            )
-
-            try:
-
-                result = run_one(
-                    gene_name,
-                    sequence,
-                    config,
-                )
-
-                results.append(
-                    result
-                )
-
-                successful += 1
-
-                if not result[
-                    "protein_preserved"
-                ]:
-                    protein_failures += 1
-
-                print(
-                    f"  CAI: "
-                    f"{result['original_cai']:.4f} "
-                    f"-> "
-                    f"{result['optimized_cai']:.4f}"
-                )
-
-                print(
-                    f"  Delta CAI: "
-                    f"{result['delta_cai']:+.4f}"
-                )
-
-                print(
-                    f"  GC: "
-                    f"{result['original_gc_percent']:.2f}% "
-                    f"-> "
-                    f"{result['optimized_gc_percent']:.2f}%"
-                )
-
-                if (
-                    result[
-                        "five_prime_gc_percent"
-                    ]
-                    != ""
-                ):
-
-                    print(
-                        f"  5' GC: "
-                        f"{result['five_prime_gc_percent']:.2f}%"
+            for s in seeds:
+                start = time.perf_counter()
+                try:
+                    cand = optimize_ga(
+                        dna_sequence=original,
+                        organism=ORGANISM,
+                        population_size=ga_pop,
+                        generations=ga_gen,
+                        gc_min=test_constraints["gc_min"],
+                        gc_max=test_constraints["gc_max"],
+                        local_gc_window=test_constraints["local_window"],
+                        local_gc_min=test_constraints["local_min"],
+                        local_gc_max=test_constraints["local_max"],
+                        five_prime_window=test_constraints["five_prime_window"],
+                        five_prime_gc_min=test_constraints["five_prime_min"],
+                        five_prime_gc_max=test_constraints["five_prime_max"],
+                        repeat_length=test_constraints["repeat_length"],
+                        max_homopolymer=test_constraints["max_homopolymer"],
+                        forbidden_sites=test_constraints["forbidden_sites"],
+                        five_prime_gc_weight=50.0,
+                        seed=s,
+                        return_history=False,
                     )
+                    elapsed = time.perf_counter() - start
+                    ass = assess_candidate(original, cand, test_constraints)
+                    cand_cai = calculate_cai(cand, ORGANISM)
+                    cand_gc = gc_content(cand)
 
-                if (
-                    result["max_kmer"]
-                    != ""
-                ):
-
+                    detailed_rows.append({
+                        "gene": gene_name,
+                        "config_name": cfg["config_name"],
+                        "category": cfg["category"],
+                        "seed": s,
+                        "repeat_threshold": cfg["repeat_length"],
+                        "five_prime_min": cfg["five_prime_min"],
+                        "five_prime_max": cfg["five_prime_max"],
+                        "local_min": cfg["local_min"],
+                        "local_max": cfg["local_max"],
+                        "original_cai": round(orig_cai, 6),
+                        "optimized_cai": round(cand_cai, 6),
+                        "delta_cai": round(cand_cai - orig_cai, 6),
+                        "global_gc": ass["global_gc"],
+                        "gc_deviation": round(abs(cand_gc - 0.50), 6),
+                        "five_prime_gc": ass["five_prime_gc"],
+                        "min_local_gc": ass["min_local_gc"],
+                        "max_local_gc": ass["max_local_gc"],
+                        "longest_homopolymer": ass["longest_homopolymer"],
+                        "repeat_count": ass["repeat_count"],
+                        "restriction_count": ass["restriction_count"],
+                        "edit_rate": ass["edit_rate"],
+                        "protein_preserved": ass["protein_preserved"],
+                        "feasible": ass["feasible"],
+                        "runtime_seconds": round(elapsed, 4),
+                        "failure_reasons": "; ".join(ass["failure_reasons"]),
+                    })
                     print(
-                        f"  Max 6-mer: "
-                        f"{result['max_kmer']} "
-                        f"("
-                        f"{result['max_kmer_frequency']:.4f}"
-                        f")"
+                        f"  [{gene_name}] {cfg['config_name']} (seed={s}): "
+                        f"CAI={cand_cai:.4f}, Feasible={ass['feasible']} in {elapsed:.2f}s"
                     )
+                except Exception as exc:
+                    elapsed = time.perf_counter() - start
+                    detailed_rows.append({
+                        "gene": gene_name,
+                        "config_name": cfg["config_name"],
+                        "category": cfg["category"],
+                        "seed": s,
+                        "repeat_threshold": cfg["repeat_length"],
+                        "five_prime_min": cfg["five_prime_min"],
+                        "five_prime_max": cfg["five_prime_max"],
+                        "local_min": cfg["local_min"],
+                        "local_max": cfg["local_max"],
+                        "original_cai": round(orig_cai, 6),
+                        "optimized_cai": None,
+                        "delta_cai": None,
+                        "feasible": False,
+                        "runtime_seconds": round(elapsed, 4),
+                        "failure_reasons": f"Error: {exc}",
+                    })
 
-                print(
-                    f"  Edit rate: "
-                    f"{result['edit_rate_percent']:.2f}%"
-                )
+    summary_rows = summarize_constraints(detailed_rows)
 
-                print(
-                    f"  Runtime: "
-                    f"{result['runtime_seconds']:.4f} s"
-                )
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    write_csv(OUT_DIR / "constraint_sensitivity.csv", detailed_rows)
+    write_csv(OUT_DIR / "constraint_summary.csv", summary_rows)
 
-                print(
-                    f"  Protein preserved: "
-                    f"{result['protein_preserved']}"
-                )
-
-            except Exception as exc:
-
-                errors += 1
-
-                print(
-                    f"  ERROR: "
-                    f"{type(exc).__name__}: "
-                    f"{exc}"
-                )
-
-
-    # ========================================================
-    # SAVE RESULTS
-    # ========================================================
-
-    OUTPUT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    fieldnames = [
-        "gene",
-        "experiment",
-        "type",
-
-        "kmer_size",
-        "kmer_threshold",
-        "kmer_weight",
-
-        "five_prime_window",
-        "five_prime_gc_min",
-        "five_prime_gc_max",
-        "five_prime_gc_weight",
-
-        "original_cai",
-        "optimized_cai",
-        "delta_cai",
-
-        "original_gc_percent",
-        "optimized_gc_percent",
-
-        "five_prime_gc_percent",
-
-        "max_kmer",
-        "max_kmer_frequency",
-
-        "changed_codons",
-        "total_codons",
-        "edit_rate_percent",
-
-        "runtime_seconds",
-
-        "protein_preserved",
-        "sequence_changed",
-    ]
-
-    with open(
-        OUTPUT_FILE,
-        "w",
-        newline="",
-        encoding="utf-8",
-    ) as f:
-
-        writer = csv.DictWriter(
-            f,
-            fieldnames=fieldnames,
+    print("\n" + "=" * 75)
+    print("CONSTRAINT SENSITIVITY SUMMARY")
+    print("=" * 75)
+    print(f"{'Configuration':<28} | {'Runs':<5} | {'Feasible %':<10} | {'Mean CAI':<9} | {'Runtime (s)':<10}")
+    print("-" * 75)
+    for s in summary_rows:
+        print(
+            f"{s['config_name']:<28} | {s['total_runs']:<5} | {str(s['feasibility_rate_percent']) + '%':<10} | "
+            f"{str(s['mean_feasible_cai']):<9} | {s['mean_runtime_seconds']:<10.3f}"
         )
-
-        writer.writeheader()
-
-        writer.writerows(
-            results
-        )
-
-
-    # ========================================================
-    # SUMMARY
-    # ========================================================
-
-    print()
-
-    print("=" * 75)
-    print("CONSTRAINT SENSITIVITY COMPLETE")
     print("=" * 75)
 
-    print(
-        f"Successful runs          : "
-        f"{successful}/{total_runs}"
-    )
-
-    print(
-        f"Errors                   : "
-        f"{errors}"
-    )
-
-    print(
-        f"Protein preservation fail: "
-        f"{protein_failures}"
-    )
-
-    print()
-
-    print(
-        "Results saved to:"
-    )
-
-    print(
-        OUTPUT_FILE
-    )
-
-    print("=" * 75)
-
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
 
 if __name__ == "__main__":
     main()
