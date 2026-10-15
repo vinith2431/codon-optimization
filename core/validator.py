@@ -121,84 +121,114 @@ def assess_candidate(
 
     # 3. Global GC
     cand_gc = gc_content(candidate)
-    global_gc_pass = gc_in_range(candidate, cfg["gc_min"], cfg["gc_max"])
+    gc_min = cfg.get("gc_min")
+    gc_max = cfg.get("gc_max")
+    global_gc_pass = gc_in_range(candidate, gc_min, gc_max)
     if not global_gc_pass:
+        min_s = f"{gc_min:.2f}" if gc_min is not None else "-inf"
+        max_s = f"{gc_max:.2f}" if gc_max is not None else "+inf"
         failure_reasons.append(
-            f"Global GC {cand_gc:.4f} outside [{cfg['gc_min']:.2f}, {cfg['gc_max']:.2f}]"
+            f"Global GC {cand_gc:.4f} outside [{min_s}, {max_s}]"
         )
 
     # 4. 5' GC (First window)
-    five_prime_window = cfg["five_prime_window"]
+    five_prime_window = cfg.get("five_prime_window", 60)
+    five_min = cfg.get("five_prime_min")
+    five_max = cfg.get("five_prime_max")
     five_prime_gc_val = None
-    five_prime_gc_pass = False
+    five_prime_gc_pass = True
+
     if len(candidate) >= five_prime_window:
         five_prime_gc_val = gc_content(candidate[:five_prime_window])
-        five_prime_gc_pass = (cfg["five_prime_min"] <= five_prime_gc_val <= cfg["five_prime_max"])
-        if not five_prime_gc_pass:
-            failure_reasons.append(
-                f"5' GC ({five_prime_gc_val:.4f} over first {five_prime_window} bp) "
-                f"outside [{cfg['five_prime_min']:.2f}, {cfg['five_prime_max']:.2f}]"
-            )
     else:
-        # Sequence shorter than window
         five_prime_gc_val = cand_gc
-        five_prime_gc_pass = (cfg["five_prime_min"] <= cand_gc <= cfg["five_prime_max"])
-        if not five_prime_gc_pass:
-            failure_reasons.append(
-                f"5' GC ({cand_gc:.4f}) outside [{cfg['five_prime_min']:.2f}, {cfg['five_prime_max']:.2f}]"
-            )
+
+    if five_min is not None and five_prime_gc_val < five_min:
+        five_prime_gc_pass = False
+    if five_max is not None and five_prime_gc_val > five_max:
+        five_prime_gc_pass = False
+
+    if not five_prime_gc_pass:
+        min_s = f"{five_min:.2f}" if five_min is not None else "-inf"
+        max_s = f"{five_max:.2f}" if five_max is not None else "+inf"
+        failure_reasons.append(
+            f"5' GC ({five_prime_gc_val:.4f} over first {min(len(candidate), five_prime_window)} bp) "
+            f"outside [{min_s}, {max_s}]"
+        )
 
     # 5. Local sliding-window GC
-    local_window = cfg["local_window"]
-    local_gc_pass = False
+    local_window = cfg.get("local_window", 60)
+    loc_min = cfg.get("local_min")
+    loc_max = cfg.get("local_max")
+    local_gc_pass = True
     min_local_gc = None
     max_local_gc = None
+
     if len(candidate) >= local_window:
         windows = local_gc_content(candidate, local_window)
         gc_vals = [w["gc_content"] for w in windows]
-        min_local_gc = min(gc_vals)
-        max_local_gc = max(gc_vals)
-        local_gc_pass = (min_local_gc >= cfg["local_min"]) and (max_local_gc <= cfg["local_max"])
-        if not local_gc_pass:
-            failure_reasons.append(
-                f"Local GC in [{min_local_gc:.4f}, {max_local_gc:.4f}] violates "
-                f"[{cfg['local_min']:.2f}, {cfg['local_max']:.2f}] (window={local_window} bp)"
-            )
+        min_local_gc = min(gc_vals) if gc_vals else cand_gc
+        max_local_gc = max(gc_vals) if gc_vals else cand_gc
     else:
         min_local_gc = cand_gc
         max_local_gc = cand_gc
-        local_gc_pass = (cfg["local_min"] <= cand_gc <= cfg["local_max"])
+
+    if loc_min is not None and min_local_gc < loc_min:
+        local_gc_pass = False
+    if loc_max is not None and max_local_gc > loc_max:
+        local_gc_pass = False
+
+    if not local_gc_pass:
+        min_s = f"{loc_min:.2f}" if loc_min is not None else "-inf"
+        max_s = f"{loc_max:.2f}" if loc_max is not None else "+inf"
+        failure_reasons.append(
+            f"Local GC in [{min_local_gc:.4f}, {max_local_gc:.4f}] violates "
+            f"[{min_s}, {max_s}] (window={local_window} bp)"
+        )
 
     # 6. Homopolymers
-    homopolymers = find_homopolymers(candidate, cfg["max_homopolymer"])
-    homopolymer_pass = len(homopolymers) == 0
+    max_homopolymer = cfg.get("max_homopolymer")
     longest_homopolymer = longest_homopolymer_run(candidate)
-    if not homopolymer_pass:
-        failure_reasons.append(
-            f"Longest homopolymer run is {longest_homopolymer} bp (exceeds max {cfg['max_homopolymer']})"
-        )
+    if max_homopolymer is not None:
+        homopolymers = find_homopolymers(candidate, max_homopolymer)
+        homopolymer_pass = len(homopolymers) == 0
+        if not homopolymer_pass:
+            failure_reasons.append(
+                f"Longest homopolymer run is {longest_homopolymer} bp (exceeds max {max_homopolymer})"
+            )
+    else:
+        homopolymers = []
+        homopolymer_pass = True
 
     # 7. Repeated subsequences
-    repeat_length = cfg["repeat_length"]
-    repeats = find_repeats(candidate, repeat_length)
-    repeat_pass = len(repeats) == 0
-    if not repeat_pass:
-        failure_reasons.append(
-            f"Found {len(repeats)} repeated substrings of length >= {repeat_length} bp"
-        )
+    repeat_length = cfg.get("repeat_length")
+    if repeat_length is not None:
+        repeats = find_repeats(candidate, repeat_length)
+        repeat_pass = len(repeats) == 0
+        if not repeat_pass:
+            failure_reasons.append(
+                f"Found {len(repeats)} repeated substrings of length >= {repeat_length} bp"
+            )
+    else:
+        repeats = []
+        repeat_pass = True
 
     # 8. Restriction sites
-    forbidden_sites = cfg.get("forbidden_sites", [])
+    forbidden_sites = cfg.get("forbidden_sites")
     check_rc = cfg.get("check_reverse_complement", True)
-    restriction_violations = find_restriction_sites(
-        candidate, forbidden_sites, check_reverse_complement=check_rc
-    )
-    restriction_pass = len(restriction_violations) == 0
-    if not restriction_pass:
-        found_names = [f"{v['site']}@{v['start']}" for v in restriction_violations]
-        failure_reasons.append(
-            f"Found forbidden restriction sites: {', '.join(found_names)}"
+    if forbidden_sites:
+        restriction_violations = find_restriction_sites(
+            candidate, forbidden_sites, check_reverse_complement=check_rc
         )
+        restriction_pass = len(restriction_violations) == 0
+        if not restriction_pass:
+            found_names = [f"{v['site']}@{v['start']}" for v in restriction_violations]
+            failure_reasons.append(
+                f"Found forbidden restriction sites: {', '.join(found_names)}"
+            )
+    else:
+        restriction_violations = []
+        restriction_pass = True
 
     # 9. Conjunction of all constraints
     feasible = (

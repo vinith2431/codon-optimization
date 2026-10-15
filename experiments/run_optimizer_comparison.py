@@ -272,6 +272,7 @@ def main():
                 local_gc_window=60,
                 forbidden_sites=DEFAULT_CONSTRAINTS["forbidden_sites"],
                 max_homopolymer=6,
+                repeat_length=12,
             )
             row = build_result_row(gene_name, "MILP_constrained", original, cand, time.perf_counter() - start)
         except Exception as exc:

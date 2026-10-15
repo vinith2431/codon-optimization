@@ -35,6 +35,7 @@ from core.verification import (
     translate_dna,
     verify_translation,
 )
+from core.validator import assess_candidate
 from data.codon_tables import get_codon_table
 
 from constraints.local_gc import local_gc_violations
@@ -1667,49 +1668,56 @@ def optimize_ga(
     )
 
     # ========================================================
-    # Global GC feasibility
+    # Full constraint validation & Feasible selection
     # ========================================================
 
-    if not is_gc_feasible(
+    active_constraints: Dict[str, Any] = {
+        "gc_min": gc_min,
+        "gc_max": gc_max,
+        "local_window": local_gc_window or 60,
+        "local_min": local_gc_min,
+        "local_max": local_gc_max,
+        "five_prime_window": five_prime_window or 60,
+        "five_prime_min": five_prime_gc_min,
+        "five_prime_max": five_prime_gc_max,
+        "max_homopolymer": max_homopolymer,
+        "repeat_length": repeat_length,
+        "forbidden_sites": forbidden_sites if forbidden_sites is not None else [],
+    }
+
+    best_assessment = assess_candidate(
+        dna_sequence,
         optimized_sequence,
-        gc_min,
-        gc_max,
-    ):
+        active_constraints,
+    )
+
+    if not best_assessment["feasible"]:
 
         feasible_candidates = []
 
         for individual in population:
-
-            candidate = "".join(
-                individual
-            )
-
-            if is_gc_feasible(
+            candidate = "".join(individual)
+            cand_assessment = assess_candidate(
+                dna_sequence,
                 candidate,
-                gc_min,
-                gc_max,
-            ):
-
-                feasible_candidates.append(
-                    individual
-                )
+                active_constraints,
+            )
+            if cand_assessment["feasible"]:
+                feasible_candidates.append(individual)
 
         if feasible_candidates:
-
             best_feasible = max(
                 feasible_candidates,
                 key=fitness,
             )
-
-            optimized_sequence = "".join(
-                best_feasible
-            )
-
+            best_individual = best_feasible.copy()
+            optimized_sequence = "".join(best_feasible)
         else:
-
+            reasons = "; ".join(best_assessment.get("failure_reasons", []))
             raise RuntimeError(
-                "GA did not find a sequence satisfying "
-                "the requested global GC constraint."
+                f"GA did not find a sequence satisfying all configured constraints: {reasons}"
+                if reasons
+                else "GA did not find a sequence satisfying all configured constraints."
             )
 
     # ========================================================
