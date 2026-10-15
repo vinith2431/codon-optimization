@@ -363,6 +363,10 @@ def main():
         detailed_rows.append(row)
         print(f"  NSGA-II: CAI={row['optimized_cai']}, Feasible={row['feasible']}")
 
+        # Incrementally persist results to disk after each gene
+        write_csv(OUT_DIR / "optimizer_comparison.csv", detailed_rows)
+        write_csv(OUT_DIR / "optimizer_summary.csv", generate_summary(detailed_rows))
+
     # Write per-run detailed results and aggregated summary
     summary_rows = generate_summary(detailed_rows)
 

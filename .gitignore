@@ -48,4 +48,5 @@ Thumbs.db
 data/genes/ncbi_extracted/
 *-backup
 results/csv_backup*/
+results/smoke_backup*/
 results/logs/

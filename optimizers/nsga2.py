@@ -22,6 +22,10 @@ from core.sequence import clean_dna, gc_content, get_codons
 from core.similarity import edit_rate
 from core.verification import CODON_TO_AA, translate_dna, verify_translation
 from core.validator import assess_candidate, DEFAULT_CONSTRAINTS
+from constraints.local_gc import local_gc_violations
+from constraints.homopolymer import find_homopolymers
+from constraints.repeats import find_repeats
+from constraints.restriction_sites import find_restriction_sites
 from data.codon_tables import get_codon_table
 
 
@@ -76,10 +80,6 @@ class Individual:
         # Objectives to minimize
         self.objectives = [-self.cai, self.gc_dev, self.edit]
 
-        # Independent feasibility assessment
-        self.assessment = assess_candidate(original_sequence, self.sequence, constraints)
-        self.feasible = self.assessment["feasible"]
-
         # Quantitative constraint violation calculation
         cfg = dict(DEFAULT_CONSTRAINTS)
         if constraints:
@@ -87,47 +87,78 @@ class Individual:
 
         violation = 0.0
         # Global GC violation
-        if actual_gc < cfg["gc_min"]:
-            violation += cfg["gc_min"] - actual_gc
-        elif actual_gc > cfg["gc_max"]:
-            violation += actual_gc - cfg["gc_max"]
+        gc_min = cfg.get("gc_min")
+        gc_max = cfg.get("gc_max")
+        if gc_min is not None and actual_gc < gc_min:
+            violation += gc_min - actual_gc
+        elif gc_max is not None and actual_gc > gc_max:
+            violation += actual_gc - gc_max
 
         # 5' GC violation
-        p5 = self.assessment.get("five_prime_gc")
-        if p5 is not None:
-            if p5 < cfg["five_prime_min"]:
-                violation += cfg["five_prime_min"] - p5
-            elif p5 > cfg["five_prime_max"]:
-                violation += p5 - cfg["five_prime_max"]
+        p5_min = cfg.get("five_prime_min")
+        p5_max = cfg.get("five_prime_max")
+        p5_win = cfg.get("five_prime_window", 60)
+        if p5_min is not None or p5_max is not None:
+            p5 = gc_content(self.sequence[: min(len(self.sequence), p5_win)])
+            if p5_min is not None and p5 < p5_min:
+                violation += p5_min - p5
+            elif p5_max is not None and p5 > p5_max:
+                violation += p5 - p5_max
 
-        # Local GC violation
-        if not self.assessment.get("local_gc_pass", True):
-            min_loc = self.assessment.get("min_local_gc", actual_gc)
-            max_loc = self.assessment.get("max_local_gc", actual_gc)
-            if min_loc < cfg["local_min"]:
-                violation += cfg["local_min"] - min_loc
-            if max_loc > cfg["local_max"]:
-                violation += max_loc - cfg["local_max"]
+        # Local GC violation (using optimized rolling window)
+        loc_min = cfg.get("local_min")
+        loc_max = cfg.get("local_max")
+        loc_win = cfg.get("local_window", 60)
+        if (loc_min is not None or loc_max is not None) and len(self.sequence) >= loc_win:
+            v_windows = local_gc_violations(self.sequence, loc_win, loc_min, loc_max)
+            if v_windows:
+                violation += len(v_windows) * 0.05
 
         # Homopolymer violation
-        longest_hp = self.assessment.get("longest_homopolymer", 0)
-        if longest_hp > cfg["max_homopolymer"]:
-            violation += (longest_hp - cfg["max_homopolymer"]) * 0.1
+        max_hp = cfg.get("max_homopolymer")
+        if max_hp is not None and max_hp > 0:
+            hps = find_homopolymers(self.sequence, max_hp)
+            if hps:
+                violation += len(hps) * 0.1
 
         # Repeats violation
-        rep_count = self.assessment.get("repeat_count", 0)
-        if rep_count > 0:
-            violation += rep_count * 0.1
+        rep_len = cfg.get("repeat_length")
+        if rep_len is not None and rep_len > 0:
+            reps = find_repeats(self.sequence, rep_len)
+            if reps:
+                violation += len(reps) * 0.1
 
         # Restriction site violation
-        res_count = self.assessment.get("restriction_count", 0)
-        if res_count > 0:
-            violation += res_count * 0.2
+        forbidden = cfg.get("forbidden_sites")
+        if forbidden:
+            check_rc = cfg.get("check_reverse_complement", True)
+            sites = find_restriction_sites(self.sequence, forbidden, check_reverse_complement=check_rc)
+            if sites:
+                violation += len(sites) * 0.2
 
-        if not self.assessment.get("protein_preserved", True):
-            violation += 10.0
+        # Independent validator is authoritative for feasibility.
+        self.assessment = assess_candidate(
+            original_sequence, self.sequence, constraints
+        )
+
+        # Penalize every failed validator check so infeasible candidates
+        # cannot be treated as feasible during constrained selection.
+        checks = (
+            "protein_preserved",
+            "global_gc_pass",
+            "local_gc_pass",
+            "five_prime_gc_pass",
+            "homopolymer_pass",
+            "repeat_pass",
+            "restriction_pass",
+        )
+        failed_checks = sum(
+            not self.assessment.get(check, False) for check in checks
+        )
+        violation += float(failed_checks)
 
         self.constraint_violation = violation
+        self.feasible = bool(self.assessment["feasible"])
 
 
 def constrained_dominates(ind_a: Individual, ind_b: Individual) -> bool:
@@ -380,6 +411,8 @@ def optimize_nsga2(
         if ind.sequence in seen_seqs:
             continue
         seen_seqs.add(ind.sequence)
+        ind.assessment = assess_candidate(clean_seq, ind.sequence, constraints)
+        ind.feasible = ind.assessment["feasible"]
         results.append({
             "sequence": ind.sequence,
             "cai": round(ind.cai, 6),

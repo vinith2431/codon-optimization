@@ -40,28 +40,38 @@ def local_gc_content(sequence, window_size):
 
     results = []
 
-    for start in range(
-        0,
-        len(sequence) - window_size + 1
-    ):
+    # Initial window count
+    first_window = sequence[:window_size]
+    gc_count = first_window.count("G") + first_window.count("C")
+    gc = gc_count / window_size
 
-        window = sequence[
-            start:start + window_size
-        ]
+    results.append({
+        "start": 0,
+        "end": window_size,
+        "sequence": first_window,
+        "gc_content": gc,
+        "gc_percentage": gc * 100.0,
+    })
 
-        gc_count = (
-            window.count("G")
-            + window.count("C")
-        )
+    # Rolling window update
+    gc_chars = {"G", "C"}
+    for start in range(1, len(sequence) - window_size + 1):
+        departing = sequence[start - 1]
+        entering = sequence[start + window_size - 1]
+
+        if departing in gc_chars:
+            gc_count -= 1
+        if entering in gc_chars:
+            gc_count += 1
 
         gc = gc_count / window_size
 
         results.append({
             "start": start,
             "end": start + window_size,
-            "sequence": window,
+            "sequence": sequence[start : start + window_size],
             "gc_content": gc,
-            "gc_percentage": gc * 100
+            "gc_percentage": gc * 100.0,
         })
 
     return results
