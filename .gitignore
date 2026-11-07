@@ -50,3 +50,4 @@ data/genes/ncbi_extracted/
 results/csv_backup*/
 results/smoke_backup*/
 results/logs/
+*.zip
